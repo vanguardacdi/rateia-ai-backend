@@ -11,6 +11,10 @@ CREATE TABLE IF NOT EXISTS users (
   plan        TEXT NOT NULL DEFAULT 'free', -- 'free' | 'plus'
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- ID da assinatura no Mercado Pago (preapproval), pra cancelar depois e
+-- pra cruzar com o webhook. Fica nulo pra quem nunca assinou (ou ganhou
+-- o Plus via código de proprietário).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mp_preapproval_id TEXT;
 
 CREATE TABLE IF NOT EXISTS groups (
   id                  TEXT PRIMARY KEY,
