@@ -17,7 +17,7 @@ require('dotenv').config();
 const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
-const { MercadoPagoConfig, Payment } = require('mercadopago');
+const { MercadoPagoConfig, Payment, PreApproval } = require('mercadopago');
 
 const pool = require('./db');
 const {
@@ -39,6 +39,7 @@ app.use(express.json());
 
 const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN || '' });
 const mpPayment = new Payment(mpClient);
+const mpPreapproval = new PreApproval(mpClient);
 
 // Pequeno helper pra rotas async não precisarem repetir try/catch toda hora.
 function wrap(handler) {
@@ -77,14 +78,74 @@ app.post('/api/account/login', wrap(async (req, res) => {
   res.json({ plan: user.plan });
 }));
 
-// Simula assinar/cancelar o Plus pra essa conta.
-app.patch('/api/account', wrap(async (req, res) => {
-  const { code, plan } = req.body || {};
-  if (plan !== 'free' && plan !== 'plus') throw httpError(400, 'Plano inválido.');
+// Inicia uma assinatura real do Plus via Mercado Pago. Devolve o link de
+// checkout — o cartão é digitado lá no Mercado Pago, nunca aqui no nosso site.
+app.post('/api/account/subscribe', wrap(async (req, res) => {
+  const { code, email } = req.body || {};
+  if (!email || !email.includes('@')) throw httpError(400, 'Informe um e-mail válido.');
   const user = await findUserByCode(code);
   if (!user) throw httpError(404, 'Código não encontrado.');
-  await pool.query('UPDATE users SET plan = $1 WHERE id = $2', [plan, user.id]);
-  res.json({ plan });
+  if (user.plan === 'plus') throw httpError(400, 'Essa conta já está no Plus.');
+
+  const result = await mpPreapproval.create({
+    body: {
+      reason: 'Rateia.AI Plus - assinatura mensal',
+      external_reference: user.id,
+      payer_email: email,
+      back_url: process.env.APP_URL || 'https://rateia-ai.netlify.app',
+      auto_recurring: {
+        frequency: 1,
+        frequency_type: 'months',
+        transaction_amount: 9.90,
+        currency_id: 'BRL'
+      }
+    }
+  });
+
+  await pool.query('UPDATE users SET mp_preapproval_id = $1 WHERE id = $2', [result.id, user.id]);
+  res.json({ checkoutUrl: result.init_point });
+}));
+
+// Cancela a assinatura ativa (se houver) e volta a conta pro Grátis.
+app.post('/api/account/cancel-subscription', wrap(async (req, res) => {
+  const { code } = req.body || {};
+  const user = await findUserByCode(code);
+  if (!user) throw httpError(404, 'Código não encontrado.');
+  if (!user.mp_preapproval_id) {
+    throw httpError(400, 'Esse Plus foi liberado manualmente — não tem assinatura paga pra cancelar.');
+  }
+  await mpPreapproval.update({ id: user.mp_preapproval_id, body: { status: 'cancelled' } });
+  await pool.query("UPDATE users SET plan = 'free' WHERE id = $1", [user.id]);
+  res.json({ plan: 'free' });
+}));
+
+// Código de liberação manual — pra você (o dono do app) ter Plus sem pagar.
+// Defina OWNER_CODE nas variáveis de ambiente do backend pra ativar isso.
+app.post('/api/account/redeem', wrap(async (req, res) => {
+  const { code, redeemCode } = req.body || {};
+  if (!process.env.OWNER_CODE || !redeemCode || redeemCode !== process.env.OWNER_CODE) {
+    throw httpError(403, 'Código inválido.');
+  }
+  const user = await findUserByCode(code);
+  if (!user) throw httpError(404, 'Código de conta não encontrado.');
+  await pool.query("UPDATE users SET plan = 'plus' WHERE id = $1", [user.id]);
+  res.json({ plan: 'plus' });
+}));
+
+// Webhook do Mercado Pago: avisa quando uma assinatura é autorizada,
+// pausada ou cancelada. É isso que mantém o plano em dia sem precisar
+// que o usuário faça nada depois de pagar.
+app.post('/api/account/webhook', wrap(async (req, res) => {
+  const preapprovalId = (req.body && req.body.data && req.body.data.id) || req.query.id || req.query['data.id'];
+  if (preapprovalId) {
+    const preapproval = await mpPreapproval.get({ id: preapprovalId });
+    const userId = preapproval.external_reference;
+    const newPlan = preapproval.status === 'authorized' ? 'plus' : 'free';
+    if (userId) {
+      await pool.query('UPDATE users SET plan = $1, mp_preapproval_id = $2 WHERE id = $3', [newPlan, preapprovalId, userId]);
+    }
+  }
+  res.sendStatus(200);
 }));
 
 /* =====================================================================
